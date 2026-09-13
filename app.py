@@ -120,9 +120,25 @@ def calculate_scenario_valuation(init_price, growth_rate, exit_multiple, proj_ye
     }
 
 
+def get_actionable_signal(current_price, intrinsic_value):
+    """Generates Buy/Hold/Sell signal based on Margin of Safety."""
+    upside = ((intrinsic_value - current_price) / current_price) * 100
+    
+    if upside >= 15.0:
+        return "🟢 BUY (STRONG MARGIN OF SAFETY)", "success", upside
+    elif 5.0 <= upside < 15.0:
+        return "🟢 ACCUMULATE / MODERATE BUY", "success", upside
+    elif -10.0 <= upside < 5.0:
+        return "🟡 HOLD / FAIRLY VALUED", "warning", upside
+    elif -25.0 <= upside < -10.0:
+        return "🟠 TRIM / OVERVALUED", "warning", upside
+    else:
+        return "🔴 SELL / SIGNIFICANT OVERVALUATION", "error", upside
+
+
 # --- STREAMLIT UI ---
 
-st.title("📊 Universal Valuation & Intrinsic Value Scenario Model")
+st.title("📊 Universal Asset Valuation & Intrinsic Value Scenario Model")
 st.markdown("Project **Low, Medium (Base), and High Intrinsic Value** scenarios for any Stock, ETF, Bond, or Fund.")
 
 col_search, _ = st.columns([1, 2])
@@ -208,6 +224,17 @@ if ticker_input:
             delta_color="normal"
         )
         c3.caption(f"Target {proj_years}Y Price: **${scenarios['High Case']['target_price']:,.2f}**")
+
+        # Recommendation Banner
+        st.write("")
+        signal_text, signal_type, margin = get_actionable_signal(init_price, med_iv)
+
+        if signal_type == "success":
+            st.success(f"**Model Recommendation:** {signal_text} (Margin of Safety: +{margin:.1f}%)")
+        elif signal_type == "warning":
+            st.warning(f"**Model Recommendation:** {signal_text} (Variance: {margin:.1f}%)")
+        else:
+            st.error(f"**Model Recommendation:** {signal_text} (Downside Risk: {margin:.1f}%)")
 
         # Trajectory Chart & Data Table
         st.write("---")
