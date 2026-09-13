@@ -5,7 +5,7 @@ import numpy as np
 
 # Set page config
 st.set_page_config(
-    page_title="Universal Asset Projection Model",
+    page_title="Universal Asset Valuation & Intrinsic Value Model",
     page_icon="📈",
     layout="wide"
 )
@@ -17,7 +17,6 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
     """
     ticker = yf.Ticker(ticker_symbol)
     
-    # yfinance info dictionary can sometimes throw errors or return empty
     try:
         info = ticker.info or {}
     except Exception:
@@ -33,7 +32,6 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
         or info.get("regularMarketPrice")
     )
     
-    # If info fails to get price, fall back to recent daily history
     if not current_price:
         try:
             hist = ticker.history(period="5d")
@@ -44,7 +42,6 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
         except Exception:
             current_price = 100.0
 
-    # Baseline defaults
     growth_rate = 0.05
     exit_multiple = 15.0
     asset_class = "Stock"
@@ -52,7 +49,6 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
     # Asset Classification & Parameter Calibration
     if quote_type == "ETF":
         asset_class = "ETF"
-        # Calculate 5-year historical CAGR if available
         try:
             hist = ticker.history(period="5y")
             if len(hist) > 250:
@@ -64,34 +60,27 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
         except Exception:
             growth_rate = 0.06
         
-        # Aggregate P/E if available, else benchmark
         exit_multiple = info.get("trailingPE") or 18.0
 
     elif quote_type in ["MUTUALFUND", "MONEYMARKET"]:
         asset_class = "Fund / Bond"
-        # Use distribution yield or SEC yield
         growth_rate = info.get("yield") or info.get("threeYearAverageReturn") or 0.04
         exit_multiple = 1.0
 
     else:
-        # Standard Equity / Stock
         asset_class = "Stock"
-        
-        # 1. Growth Rate Fallback: Analyst Earnings Growth -> Revenue Growth -> Default 7%
         growth_rate = (
             info.get("earningsGrowth") 
             or info.get("revenueGrowth") 
             or 0.07
         )
-        
-        # 2. Exit Multiple Fallback: Forward PE -> Trailing PE -> Baseline 20x
         exit_multiple = (
             info.get("forwardPE") 
             or info.get("trailingPE") 
             or 20.0
         )
 
-    # Sanity Clamping: Prevent extreme outliers from breaking sliders
+    # Sanity Clamping
     growth_rate = max(-0.25, min(float(growth_rate), 0.50))
     if asset_class == "Stock":
         exit_multiple = max(3.0, min(float(exit_multiple), 80.0))
@@ -106,10 +95,35 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
     }
 
 
+def calculate_scenario_valuation(init_price, growth_rate, exit_multiple, proj_years, trailing_pe, asset_class, discount_rate=0.09):
+    """
+    Calculates projected target price and present intrinsic value for a given scenario.
+    """
+    compounded_val = init_price * ((1 + growth_rate) ** proj_years)
+    
+    if asset_class == "Stock" and trailing_pe:
+        pe_expansion = exit_multiple / max(trailing_pe, 1.0)
+        target_price = compounded_val * pe_expansion
+    else:
+        target_price = compounded_val
+
+    # Present Intrinsic Value via Discounted Present Value
+    intrinsic_value = target_price / ((1 + discount_rate) ** proj_years)
+    total_return = ((target_price / init_price) - 1) * 100
+    cagr = (((target_price / init_price) ** (1 / proj_years)) - 1) * 100
+
+    return {
+        "target_price": target_price,
+        "intrinsic_value": intrinsic_value,
+        "total_return": total_return,
+        "cagr": cagr
+    }
+
+
 # --- STREAMLIT UI ---
 
-st.title("📊 Universal Asset Valuation & Projection Model")
-st.markdown("Analyze and project target outcomes for **any Stock, ETF, Bond, or Fund** using dynamic fallback calibrations.")
+st.title("📊 Universal Valuation & Intrinsic Value Scenario Model")
+st.markdown("Project **Low, Medium (Base), and High Intrinsic Value** scenarios for any Stock, ETF, Bond, or Fund.")
 
 col_search, _ = st.columns([1, 2])
 with col_search:
@@ -117,7 +131,7 @@ with col_search:
 
 if ticker_input:
     try:
-        with st.spinner(f"Calibrating metadata for {ticker_input}..."):
+        with st.spinner(f"Fetching & calibrating scenarios for {ticker_input}..."):
             data = get_calibrated_inputs(ticker_input)
 
         st.subheader(f"{data['long_name']} ({ticker_input})")
@@ -126,82 +140,122 @@ if ticker_input:
         st.sidebar.header("⚙️ Model Parameters")
         st.sidebar.caption(f"Detected Asset Class: **{data['asset_class']}**")
 
-        proj_years = st.sidebar.slider(
-            "Projection Horizon (Years)", 
-            min_value=1, 
-            max_value=20, 
-            value=5
-        )
+        proj_years = st.sidebar.slider("Projection Horizon (Years)", 1, 20, 5)
+        discount_rate = st.sidebar.slider("Discount Rate / Required Return (%)", 4.0, 15.0, 9.0, step=0.5) / 100.0
 
-        calibrated_growth_pct = round(data["growth_rate"] * 100, 2)
-        growth_rate_input = st.sidebar.slider(
-            "Projected Growth / Annual Return (%)",
-            min_value=-20.0,
-            max_value=50.0,
-            value=float(calibrated_growth_pct),
-            step=0.5
-        ) / 100.0
+        # Base growth rate & multiple inputs
+        base_growth = round(data["growth_rate"] * 100, 2)
+        base_multiple = round(data["exit_multiple"], 1)
+
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🎯 Scenario Calibrations")
+        
+        # Scenario Sliders for Growth
+        growth_low = st.sidebar.slider("Low Growth Rate (%)", -20.0, 30.0, float(round(base_growth * 0.6, 2)), step=0.5) / 100.0
+        growth_med = st.sidebar.slider("Medium (Base) Growth Rate (%)", -20.0, 40.0, float(base_growth), step=0.5) / 100.0
+        growth_high = st.sidebar.slider("High Growth Rate (%)", -20.0, 60.0, float(round(base_growth * 1.4, 2)), step=0.5) / 100.0
 
         if data["asset_class"] == "Stock":
-            multiple_input = st.sidebar.slider(
-                "Target Exit P/E Multiple",
-                min_value=3.0,
-                max_value=80.0,
-                value=round(data["exit_multiple"], 1),
-                step=0.5
-            )
+            mult_low = st.sidebar.slider("Low Exit P/E", 3.0, 60.0, float(round(base_multiple * 0.75, 1)), step=0.5)
+            mult_med = st.sidebar.slider("Medium Exit P/E", 3.0, 70.0, float(base_multiple), step=0.5)
+            mult_high = st.sidebar.slider("High Exit P/E", 3.0, 80.0, float(round(base_multiple * 1.25, 1)), step=0.5)
         else:
-            multiple_input = data["exit_multiple"]
-            st.sidebar.info("💡 Exit multiples are locked or simplified for Funds, Bonds, and Index ETFs.")
+            mult_low = mult_med = mult_high = data["exit_multiple"]
 
-        # Financial Calculations
         init_price = data["current_price"]
-        compounded_val = init_price * ((1 + growth_rate_input) ** proj_years)
+        trailing_pe = data["trailing_pe"]
+        asset_class = data["asset_class"]
 
-        if data["asset_class"] == "Stock" and data["trailing_pe"]:
-            current_pe = data["trailing_pe"]
-            pe_expansion = multiple_input / max(current_pe, 1.0)
-            target_price = compounded_val * pe_expansion
-        else:
-            target_price = compounded_val
+        # Run Scenario Calculations
+        scenarios = {
+            "Low Case": calculate_scenario_valuation(init_price, growth_low, mult_low, proj_years, trailing_pe, asset_class, discount_rate),
+            "Medium (Base)": calculate_scenario_valuation(init_price, growth_med, mult_med, proj_years, trailing_pe, asset_class, discount_rate),
+            "High Case": calculate_scenario_valuation(init_price, growth_high, mult_high, proj_years, trailing_pe, asset_class, discount_rate)
+        }
 
-        total_return_pct = ((target_price / init_price) - 1) * 100
-        cagr = (((target_price / init_price) ** (1 / proj_years)) - 1) * 100
+        # Display Intrinsic Value Metric Cards
+        st.write("### 🏛️ Intrinsic Value vs Current Price")
+        st.caption(f"Current Market Price / NAV: **${init_price:,.2f}** | Required Discount Rate: **{discount_rate*100:.1f}%**")
 
-        # Output Metrics
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Current Price / NAV", f"${init_price:,.2f}")
-        m2.metric(f"Projected {proj_years}Y Price", f"${target_price:,.2f}")
-        m3.metric("Total Projected Return", f"{total_return_pct:,.1f}%")
-        m4.metric("Implied CAGR", f"{cagr:,.2f}%")
-
-        # Annual Trajectory Table & Chart
-        st.write("---")
-        st.subheader("📈 Projection Trajectory")
+        c1, c2, c3 = st.columns(3)
         
-        years_seq = list(range(0, proj_years + 1))
-        yearly_prices = []
-        for y in years_seq:
-            base_val = init_price * ((1 + growth_rate_input) ** y)
-            if data["asset_class"] == "Stock" and data["trailing_pe"]:
-                # Linearly interpolate PE expansion over time horizon
-                current_pe = data["trailing_pe"]
-                pe_step = current_pe + (multiple_input - current_pe) * (y / proj_years)
-                price = base_val * (pe_step / max(current_pe, 1.0))
-            else:
-                price = base_val
-            yearly_prices.append(price)
+        # Low Case
+        low_iv = scenarios["Low Case"]["intrinsic_value"]
+        c1.metric(
+            "Low Intrinsic Value", 
+            f"${low_iv:,.2f}", 
+            delta=f"{((low_iv / init_price) - 1) * 100:,.1f}% vs Current",
+            delta_color="normal"
+        )
+        c1.caption(f"Target {proj_years}Y Price: **${scenarios['Low Case']['target_price']:,.2f}**")
 
-        df_proj = pd.DataFrame({
-            "Year": years_seq,
-            "Projected Price ($)": yearly_prices
-        }).set_index("Year")
+        # Base Case
+        med_iv = scenarios["Medium (Base)"]["intrinsic_value"]
+        c2.metric(
+            "Medium (Base) Intrinsic Value", 
+            f"${med_iv:,.2f}", 
+            delta=f"{((med_iv / init_price) - 1) * 100:,.1f}% vs Current",
+            delta_color="normal"
+        )
+        c2.caption(f"Target {proj_years}Y Price: **${scenarios['Medium (Base)']['target_price']:,.2f}**")
+
+        # High Case
+        high_iv = scenarios["High Case"]["intrinsic_value"]
+        c3.metric(
+            "High Intrinsic Value", 
+            f"${high_iv:,.2f}", 
+            delta=f"{((high_iv / init_price) - 1) * 100:,.1f}% vs Current",
+            delta_color="normal"
+        )
+        c3.caption(f"Target {proj_years}Y Price: **${scenarios['High Case']['target_price']:,.2f}**")
+
+        # Trajectory Chart & Data Table
+        st.write("---")
+        st.subheader("📈 Multi-Scenario Projection Trajectory")
+
+        years_seq = list(range(0, proj_years + 1))
+        chart_data = {"Year": years_seq}
+
+        for sc_name, g_rate, m_val in [
+            ("Low Case", growth_low, mult_low),
+            ("Medium (Base)", growth_med, mult_med),
+            ("High Case", growth_high, mult_high)
+        ]:
+            prices = []
+            for y in years_seq:
+                base_val = init_price * ((1 + g_rate) ** y)
+                if asset_class == "Stock" and trailing_pe:
+                    pe_step = trailing_pe + (m_val - trailing_pe) * (y / proj_years)
+                    price = base_val * (pe_step / max(trailing_pe, 1.0))
+                else:
+                    price = base_val
+                prices.append(price)
+            chart_data[sc_name] = prices
+
+        df_chart = pd.DataFrame(chart_data).set_index("Year")
 
         col_chart, col_table = st.columns([2, 1])
         with col_chart:
-            st.line_chart(df_proj)
+            st.line_chart(df_chart)
         with col_table:
-            st.dataframe(df_proj.style.format("${:,.2f}"), height=250)
+            summary_df = pd.DataFrame([
+                {
+                    "Scenario": k,
+                    "Intrinsic Value": v["intrinsic_value"],
+                    "Target Price": v["target_price"],
+                    "Implied CAGR": v["cagr"]
+                }
+                for k, v in scenarios.items()
+            ]).set_index("Scenario")
+            
+            st.dataframe(
+                summary_df.style.format({
+                    "Intrinsic Value": "${:,.2f}",
+                    "Target Price": "${:,.2f}",
+                    "Implied CAGR": "{:,.2f}%"
+                }),
+                use_container_width=True
+            )
 
     except Exception as e:
         st.error(f"Unable to process ticker '{ticker_input}'. Please verify the symbol and try again.")
