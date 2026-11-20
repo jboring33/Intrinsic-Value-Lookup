@@ -1,0 +1,115 @@
+{
+  "Markets": {
+    "tickers": [
+      "VIX",
+      "$DXY",
+      "RSP",
+      "DIA",
+      "USO",
+      "IWM",
+      "SPY",
+      "QQQ",
+      "SMH"
+    ],
+    "variables": {
+      "valuation_mode": "benchmark_trend",
+      "default_discount_rate": 0.08,
+      "growth_spread_pct": 3.0,
+      "min_growth_pct": -20.0,
+      "max_growth_pct": 25.0,
+      "use_exit_multiple": false,
+      "default_exit_multiple": 1.0,
+      "min_exit_multiple": 1.0,
+      "max_exit_multiple": 1.0,
+      "track_nav_spread": false,
+      "max_realistic_cagr_pct": 15.0
+    }
+  },
+  "Covered Calls": {
+    "tickers": [
+      "JEPI",
+      "SPYI",
+      "JEPQ",
+      "QQQI"
+    ],
+    "variables": {
+      "valuation_mode": "covered_call_income_total_return",
+      "default_discount_rate": 0.075,
+      "growth_spread_pct": 2.5,
+      "min_growth_pct": -15.0,
+      "max_growth_pct": 18.0,
+      "use_exit_multiple": false,
+      "default_exit_multiple": 1.0,
+      "min_exit_multiple": 1.0,
+      "max_exit_multiple": 1.0,
+      "track_nav_spread": false,
+      "max_realistic_cagr_pct": 14.0
+    }
+  },
+  "Dividends": {
+    "tickers": [
+      "HDV",
+      "SCHD"
+    ],
+    "variables": {
+      "valuation_mode": "dividend_etf_total_return",
+      "default_discount_rate": 0.075,
+      "growth_spread_pct": 2.5,
+      "min_growth_pct": -15.0,
+      "max_growth_pct": 18.0,
+      "use_exit_multiple": false,
+      "default_exit_multiple": 1.0,
+      "min_exit_multiple": 1.0,
+      "max_exit_multiple": 1.0,
+      "track_nav_spread": false,
+      "max_realistic_cagr_pct": 13.0
+    }
+  },
+  "Foreign": {
+    "tickers": [
+      "SCHY",
+      "SDIV",
+      "DIVI",
+      "VEA",
+      "EMXC"
+    ],
+    "variables": {
+      "valuation_mode": "foreign_etf_total_return",
+      "default_discount_rate": 0.085,
+      "growth_spread_pct": 3.5,
+      "min_growth_pct": -20.0,
+      "max_growth_pct": 22.0,
+      "use_exit_multiple": false,
+      "default_exit_multiple": 1.0,
+      "min_exit_multiple": 1.0,
+      "max_exit_multiple": 1.0,
+      "track_nav_spread": false,
+      "max_realistic_cagr_pct": 15.0
+    }
+  },
+  "US Equities": {
+    "tickers": [
+      "COST",
+      "BRK/B",
+      "AAPL",
+      "SPCX",
+      "NVDA",
+      "CRWV",
+      "GOOGL",
+      "SNDK"
+    ],
+    "variables": {
+      "valuation_mode": "fundamental_dcf",
+      "default_discount_rate": 0.09,
+      "growth_spread_pct": 4.0,
+      "min_growth_pct": -20.0,
+      "max_growth_pct": 45.0,
+      "use_exit_multiple": true,
+      "default_exit_multiple": 20.0,
+      "min_exit_multiple": 4.0,
+      "max_exit_multiple": 60.0,
+      "track_nav_spread": false,
+      "max_realistic_cagr_pct": 20.0
+    }
+  }
+}
