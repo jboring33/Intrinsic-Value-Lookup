@@ -3,287 +3,241 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# Set page config
 st.set_page_config(
     page_title="Universal Asset Valuation & Intrinsic Value Model",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
+PHYSICAL_METALS_TICKERS = {
+    "PHYS": ("Gold", "Sprott Physical Gold Trust"),
+    "PSLV": ("Silver", "Sprott Physical Silver Trust"),
+    "CEF": ("Gold & Silver", "Sprott Physical Gold and Silver Trust"),
+    "SPPP": ("Platinum & Palladium", "Sprott Physical Platinum and Palladium Trust"),
+    "GLD": ("Gold", "SPDR Gold Shares"),
+    "GLDM": ("Gold", "SPDR Gold MiniShares Trust"),
+    "IAU": ("Gold", "iShares Gold Trust"),
+    "IAUM": ("Gold", "iShares Gold Trust Micro"),
+    "SGOL": ("Gold", "abrdn Physical Gold Shares ETF"),
+    "BAR": ("Gold", "GraniteShares Gold Trust"),
+    "AAAU": ("Gold", "Goldman Sachs Physical Gold ETF"),
+    "OUNZ": ("Gold", "VanEck Merk Gold ETF"),
+    "SLV": ("Silver", "iShares Silver Trust"),
+    "SIVR": ("Silver", "abrdn Physical Silver Shares ETF"),
+    "PPLT": ("Platinum", "abrdn Physical Platinum Shares ETF"),
+    "PALL": ("Palladium", "abrdn Physical Palladium Shares ETF"),
+    "CPER": ("Copper", "United States Copper Index Fund"),
+    "U.UN": ("Uranium", "Sprott Physical Uranium Trust"),
+    "SRUUF": ("Uranium", "Sprott Physical Uranium Trust"),
+}
+
+MINING_KEYWORDS = (
+    "gold",
+    "silver",
+    "precious metals",
+    "metals & mining",
+    "copper",
+    "uranium",
+    "platinum",
+    "palladium",
+    "miners",
+    "mining",
+)
+
+
+def clamp(val: float, low: float, high: float) -> float:
+    return max(low, min(float(val), high))
+
+
+def classify_asset(ticker_symbol: str, info: dict) -> tuple[str, str]:
+    """
+    Classifies a ticker into one of:
+    - Physical Bullion / Commodity Trust
+    - Metals & Mining ETF
+    - Metals & Mining Stock
+    - Equity / Income ETF
+    - Fund / Bond
+    - Stock
+    Returns (asset_class, metal_focus).
+    """
+    sym = ticker_symbol.upper().strip()
+    quote_type = (info.get("quoteType") or "EQUITY").upper()
+    name = (info.get("longName") or info.get("shortName") or "").lower()
+    summary = (info.get("longBusinessSummary") or "").lower()
+    industry = (info.get("industry") or "").lower()
+    category = (info.get("category") or "").lower()
+
+    if sym in PHYSICAL_METALS_TICKERS:
+        return "Physical Bullion / Commodity Trust", PHYSICAL_METALS_TICKERS[sym][0]
+
+    # Detect physical trusts not in the hardcoded map
+    if any(k in name for k in ("physical gold", "physical silver", "physical platinum", "physical palladium", "gold trust", "silver trust", "gold shares", "silver shares")) and "miner" not in name:
+        metal = "Silver" if "silver" in name else ("Gold" if "gold" in name else "Precious Metals")
+        return "Physical Bullion / Commodity Trust", metal
+
+    is_metals_related = any(
+        kw in text
+        for kw in MINING_KEYWORDS
+        for text in (name, industry, category, summary[:400])
+    )
+
+    if quote_type == "ETF":
+        if is_metals_related:
+            return "Metals & Mining ETF", "Metals & Mining"
+        return "Equity / Income ETF", ""
+
+    if quote_type in ("MUTUALFUND", "MONEYMARKET"):
+        return "Fund / Bond", ""
+
+    if is_metals_related:
+        return "Metals & Mining Stock", industry.title() if industry else "Metals & Mining"
+
+    return "Stock", ""
+
+
+def fetch_current_price(ticker: yf.Ticker, info: dict) -> float:
+    """Fetches current market price; raises ValueError if symbol is invalid/unpriced."""
+    for key in ("currentPrice", "regularMarketPrice", "previousClose", "navPrice"):
+        val = info.get(key)
+        if val is not None and float(val) > 0:
+            return float(val)
+
+    hist = ticker.history(period="5d", auto_adjust=False)
+    if not hist.empty and float(hist["Close"].iloc[-1]) > 0:
+        return float(hist["Close"].iloc[-1])
+
+    raise ValueError(f"No valid market price found for '{ticker.ticker}'. Check the ticker symbol.")
+
+
+def compute_historical_cagr(ticker: yf.Ticker, years: int = 5, auto_adjust: bool = True) -> float | None:
+    """Computes annualized return over `years` using adjusted close (total return) or unadjusted close."""
+    try:
+        hist = ticker.history(period=f"{years}y", auto_adjust=auto_adjust)
+        if len(hist) >= 200:
+            start_px = float(hist["Close"].iloc[0])
+            end_px = float(hist["Close"].iloc[-1])
+            actual_years = len(hist) / 252.0
+            if start_px > 0 and actual_years > 0.5:
+                return (end_px / start_px) ** (1.0 / actual_years) - 1.0
+    except Exception:
+        pass
+    return None
+
+
 def get_calibrated_inputs(ticker_symbol: str) -> dict:
-    """
-    Fetches ticker metadata via yfinance and derives reasonable baseline
-    growth rates and valuation metrics across Stocks, Bonds, and ETFs.
-    """
+    """Fetches yfinance data and calibrates realistic baseline inputs per asset class."""
     ticker = yf.Ticker(ticker_symbol)
-    
     try:
         info = ticker.info or {}
     except Exception:
         info = {}
 
-    quote_type = info.get("quoteType", "EQUITY")
-    
-    # Robust current price fallback chain
-    current_price = (
-        info.get("currentPrice") 
-        or info.get("navPrice") 
-        or info.get("previousClose")
-        or info.get("regularMarketPrice")
-    )
-    
-    if not current_price:
-        try:
-            hist = ticker.history(period="5d")
-            if not hist.empty:
-                current_price = float(hist["Close"].iloc[-1])
-            else:
-                current_price = 100.0
-        except Exception:
-            current_price = 100.0
+    current_price = fetch_current_price(ticker, info)
+    asset_class, metal_focus = classify_asset(ticker_symbol, info)
 
-    growth_rate = 0.05
-    exit_multiple = 15.0
-    asset_class = "Stock"
+    nav_price = info.get("navPrice")
+    nav_price = float(nav_price) if nav_price and float(nav_price) > 0 else None
 
-    # Asset Classification & Parameter Calibration
-    if quote_type == "ETF":
-        asset_class = "ETF"
-        try:
-            hist = ticker.history(period="5y")
-            if len(hist) > 250:
-                start_price = float(hist["Close"].iloc[0])
-                end_price = float(hist["Close"].iloc[-1])
-                years = len(hist) / 252.0
-                if start_price > 0:
-                    growth_rate = (end_price / start_price) ** (1 / years) - 1.0
-        except Exception:
-            growth_rate = 0.06
-        
-        exit_multiple = info.get("trailingPE") or 18.0
+    trailing_pe = info.get("trailingPE")
+    trailing_pe = float(trailing_pe) if trailing_pe and float(trailing_pe) > 0 else None
 
-    elif quote_type in ["MUTUALFUND", "MONEYMARKET"]:
-        asset_class = "Fund / Bond"
-        growth_rate = info.get("yield") or info.get("threeYearAverageReturn") or 0.04
+    forward_pe = info.get("forwardPE")
+    forward_pe = float(forward_pe) if forward_pe and float(forward_pe) > 0 else None
+
+    trailing_eps = info.get("trailingEps")
+    trailing_eps = float(trailing_eps) if trailing_eps is not None else None
+
+    forward_eps = info.get("forwardEps")
+    forward_eps = float(forward_eps) if forward_eps is not None else None
+
+    # Derive EPS if missing but P/E is available
+    if trailing_eps is None and trailing_pe:
+        trailing_eps = current_price / trailing_pe
+    if forward_eps is None and forward_pe:
+        forward_eps = current_price / forward_pe
+
+    rev_per_share = info.get("revenuePerShare")
+    rev_per_share = float(rev_per_share) if rev_per_share and float(rev_per_share) > 0 else None
+    ps_ratio = info.get("priceToSalesTrailing12Months")
+    ps_ratio = float(ps_ratio) if ps_ratio and float(ps_ratio) > 0 else None
+
+    div_yield = info.get("dividendYield") or info.get("yield") or 0.0
+    div_yield = float(div_yield)
+    # Normalize if yfinance returns percentage instead of decimal
+    if div_yield > 0.25:
+        div_yield = div_yield / 100.0
+    div_yield = clamp(div_yield, 0.0, 0.20)
+
+    hist_cagr_5y = compute_historical_cagr(ticker, years=5, auto_adjust=True)
+
+    # Asset-class specific calibration
+    if asset_class == "Physical Bullion / Commodity Trust":
+        # Physical metals do not generate cash flows; anchor to NAV and conservative long-term spot drift
+        raw_growth = 0.05 if hist_cagr_5y is None else clamp(0.5 * hist_cagr_5y + 0.5 * 0.05, 0.02, 0.10)
         exit_multiple = 1.0
+        valuation_basis = "NAV Premium/Discount + Spot Drift"
+
+    elif asset_class in ("Equity / Income ETF", "Metals & Mining ETF"):
+        # Blend 5Y total-return CAGR toward a realistic long-term mean to prevent bull-market extrapolation
+        long_run_anchor = 0.07 if asset_class == "Metals & Mining ETF" else 0.08
+        if hist_cagr_5y is not None:
+            raw_growth = 0.4 * hist_cagr_5y + 0.6 * long_run_anchor
+        else:
+            raw_growth = long_run_anchor
+        raw_growth = clamp(raw_growth, -0.05, 0.14)
+        exit_multiple = trailing_pe or 18.0
+        valuation_basis = "Total-Return CAGR Discounted Model"
+
+    elif asset_class == "Fund / Bond":
+        raw_growth = clamp(div_yield if div_yield > 0 else (hist_cagr_5y or 0.045), 0.01, 0.10)
+        exit_multiple = 1.0
+        valuation_basis = "Yield & NAV Compounding"
 
     else:
-        asset_class = "Stock"
-        growth_rate = (
-            info.get("earningsGrowth") 
-            or info.get("revenueGrowth") 
-            or 0.07
-        )
-        exit_multiple = (
-            info.get("forwardPE") 
-            or info.get("trailingPE") 
-            or 20.0
-        )
+        # Stock or Metals & Mining Stock
+        # Avoid using a single volatile quarter's YoY spike unblended
+        raw_eg = info.get("earningsGrowth")
+        raw_rg = info.get("revenueGrowth")
+        candidates = [float(x) for x in (raw_eg, raw_rg) if x is not None and -0.5 < float(x) < 1.0]
+        if candidates:
+            blended_g = np.mean(candidates)
+            # Mean-revert extreme single-year spikes toward 8%
+            raw_growth = 0.6 * blended_g + 0.4 * 0.08
+        elif hist_cagr_5y is not None:
+            raw_growth = clamp(hist_cagr_5y, 0.02, 0.15)
+        else:
+            raw_growth = 0.08
 
-    # Sanity Clamping
-    growth_rate = max(-0.25, min(float(growth_rate), 0.50))
-    if asset_class == "Stock":
-        exit_multiple = max(3.0, min(float(exit_multiple), 80.0))
+        max_g = 0.15 if asset_class == "Metals & Mining Stock" else 0.22
+        raw_growth = clamp(raw_growth, -0.10, max_g)
+
+        base_pe = forward_pe or trailing_pe or (14.0 if asset_class == "Metals & Mining Stock" else 18.0)
+        max_pe = 30.0 if asset_class == "Metals & Mining Stock" else 45.0
+        exit_multiple = clamp(base_pe, 5.0, max_pe)
+
+        if (forward_eps and forward_eps > 0) or (trailing_eps and trailing_eps > 0):
+            valuation_basis = "EPS × Exit P/E + Dividends (DCF)"
+        elif rev_per_share and rev_per_share > 0:
+            valuation_basis = "Revenue/Share × Exit P/S (DCF)"
+            exit_multiple = clamp(ps_ratio or 2.5, 0.5, 15.0)
+        else:
+            valuation_basis = "Price-Anchored Fallback (Missing EPS/Rev)"
 
     return {
+        "ticker": ticker_symbol.upper(),
+        "long_name": info.get("longName") or info.get("shortName") or ticker_symbol.upper(),
         "asset_class": asset_class,
-        "current_price": float(current_price),
-        "growth_rate": float(growth_rate),
+        "metal_focus": metal_focus,
+        "valuation_basis": valuation_basis,
+        "current_price": current_price,
+        "nav_price": nav_price,
+        "growth_rate": float(raw_growth),
         "exit_multiple": float(exit_multiple),
-        "long_name": info.get("longName") or info.get("shortName") or ticker_symbol,
-        "trailing_pe": info.get("trailingPE")
-    }
-
-
-def calculate_scenario_valuation(init_price, growth_rate, exit_multiple, proj_years, trailing_pe, asset_class, discount_rate=0.09):
-    """
-    Calculates projected target price and present intrinsic value for a given scenario.
-    """
-    compounded_val = init_price * ((1 + growth_rate) ** proj_years)
-    
-    if asset_class == "Stock" and trailing_pe:
-        pe_expansion = exit_multiple / max(trailing_pe, 1.0)
-        target_price = compounded_val * pe_expansion
-    else:
-        target_price = compounded_val
-
-    # Present Intrinsic Value via Discounted Present Value
-    intrinsic_value = target_price / ((1 + discount_rate) ** proj_years)
-    total_return = ((target_price / init_price) - 1) * 100
-    cagr = (((target_price / init_price) ** (1 / proj_years)) - 1) * 100
-
-    return {
-        "target_price": target_price,
-        "intrinsic_value": intrinsic_value,
-        "total_return": total_return,
-        "cagr": cagr
-    }
-
-
-def get_actionable_signal(current_price, intrinsic_value):
-    """Generates Buy/Hold/Sell signal based on Margin of Safety."""
-    upside = ((intrinsic_value - current_price) / current_price) * 100
-    
-    if upside >= 15.0:
-        return "🟢 BUY (STRONG MARGIN OF SAFETY)", "success", upside
-    elif 5.0 <= upside < 15.0:
-        return "🟢 ACCUMULATE / MODERATE BUY", "success", upside
-    elif -10.0 <= upside < 5.0:
-        return "🟡 HOLD / FAIRLY VALUED", "warning", upside
-    elif -25.0 <= upside < -10.0:
-        return "🟠 TRIM / OVERVALUED", "warning", upside
-    else:
-        return "🔴 SELL / SIGNIFICANT OVERVALUATION", "error", upside
-
-
-# --- STREAMLIT UI ---
-
-st.title("📊 Universal Asset Valuation & Intrinsic Value Scenario Model")
-st.markdown("Project **Low, Medium (Base), and High Intrinsic Value** scenarios for any Stock, ETF, Bond, or Fund.")
-
-col_search, _ = st.columns([1, 2])
-with col_search:
-    ticker_input = st.text_input("Enter Ticker Symbol:", value="AAPL").strip().upper()
-
-if ticker_input:
-    try:
-        with st.spinner(f"Fetching & calibrating scenarios for {ticker_input}..."):
-            data = get_calibrated_inputs(ticker_input)
-
-        st.subheader(f"{data['long_name']} ({ticker_input})")
-        
-        # Sidebar Controls
-        st.sidebar.header("⚙️ Model Parameters")
-        st.sidebar.caption(f"Detected Asset Class: **{data['asset_class']}**")
-
-        proj_years = st.sidebar.slider("Projection Horizon (Years)", 1, 20, 5)
-        discount_rate = st.sidebar.slider("Discount Rate / Required Return (%)", 4.0, 15.0, 9.0, step=0.5) / 100.0
-
-        # Base growth rate & multiple inputs
-        base_growth = round(data["growth_rate"] * 100, 2)
-        base_multiple = round(data["exit_multiple"], 1)
-
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🎯 Scenario Calibrations")
-        
-        # Scenario Sliders for Growth
-        growth_low = st.sidebar.slider("Low Growth Rate (%)", -20.0, 30.0, float(round(base_growth * 0.6, 2)), step=0.5) / 100.0
-        growth_med = st.sidebar.slider("Medium (Base) Growth Rate (%)", -20.0, 40.0, float(base_growth), step=0.5) / 100.0
-        growth_high = st.sidebar.slider("High Growth Rate (%)", -20.0, 60.0, float(round(base_growth * 1.4, 2)), step=0.5) / 100.0
-
-        if data["asset_class"] == "Stock":
-            mult_low = st.sidebar.slider("Low Exit P/E", 3.0, 60.0, float(round(base_multiple * 0.75, 1)), step=0.5)
-            mult_med = st.sidebar.slider("Medium Exit P/E", 3.0, 70.0, float(base_multiple), step=0.5)
-            mult_high = st.sidebar.slider("High Exit P/E", 3.0, 80.0, float(round(base_multiple * 1.25, 1)), step=0.5)
-        else:
-            mult_low = mult_med = mult_high = data["exit_multiple"]
-
-        init_price = data["current_price"]
-        trailing_pe = data["trailing_pe"]
-        asset_class = data["asset_class"]
-
-        # Run Scenario Calculations
-        scenarios = {
-            "Low Case": calculate_scenario_valuation(init_price, growth_low, mult_low, proj_years, trailing_pe, asset_class, discount_rate),
-            "Medium (Base)": calculate_scenario_valuation(init_price, growth_med, mult_med, proj_years, trailing_pe, asset_class, discount_rate),
-            "High Case": calculate_scenario_valuation(init_price, growth_high, mult_high, proj_years, trailing_pe, asset_class, discount_rate)
-        }
-
-        # Display Intrinsic Value Metric Cards
-        st.write("### 🏛️ Intrinsic Value vs Current Price")
-        st.caption(f"Current Market Price / NAV: **${init_price:,.2f}** | Required Discount Rate: **{discount_rate*100:.1f}%**")
-
-        c1, c2, c3 = st.columns(3)
-        
-        # Low Case
-        low_iv = scenarios["Low Case"]["intrinsic_value"]
-        c1.metric(
-            "Low Intrinsic Value", 
-            f"${low_iv:,.2f}", 
-            delta=f"{((low_iv / init_price) - 1) * 100:,.1f}% vs Current",
-            delta_color="normal"
-        )
-        c1.caption(f"Target {proj_years}Y Price: **${scenarios['Low Case']['target_price']:,.2f}**")
-
-        # Base Case
-        med_iv = scenarios["Medium (Base)"]["intrinsic_value"]
-        c2.metric(
-            "Medium (Base) Intrinsic Value", 
-            f"${med_iv:,.2f}", 
-            delta=f"{((med_iv / init_price) - 1) * 100:,.1f}% vs Current",
-            delta_color="normal"
-        )
-        c2.caption(f"Target {proj_years}Y Price: **${scenarios['Medium (Base)']['target_price']:,.2f}**")
-
-        # High Case
-        high_iv = scenarios["High Case"]["intrinsic_value"]
-        c3.metric(
-            "High Intrinsic Value", 
-            f"${high_iv:,.2f}", 
-            delta=f"{((high_iv / init_price) - 1) * 100:,.1f}% vs Current",
-            delta_color="normal"
-        )
-        c3.caption(f"Target {proj_years}Y Price: **${scenarios['High Case']['target_price']:,.2f}**")
-
-        # Recommendation Banner
-        st.write("")
-        signal_text, signal_type, margin = get_actionable_signal(init_price, med_iv)
-
-        if signal_type == "success":
-            st.success(f"**Model Recommendation:** {signal_text} (Margin of Safety: +{margin:.1f}%)")
-        elif signal_type == "warning":
-            st.warning(f"**Model Recommendation:** {signal_text} (Variance: {margin:.1f}%)")
-        else:
-            st.error(f"**Model Recommendation:** {signal_text} (Downside Risk: {margin:.1f}%)")
-
-        # Trajectory Chart & Data Table
-        st.write("---")
-        st.subheader("📈 Multi-Scenario Projection Trajectory")
-
-        years_seq = list(range(0, proj_years + 1))
-        chart_data = {"Year": years_seq}
-
-        for sc_name, g_rate, m_val in [
-            ("Low Case", growth_low, mult_low),
-            ("Medium (Base)", growth_med, mult_med),
-            ("High Case", growth_high, mult_high)
-        ]:
-            prices = []
-            for y in years_seq:
-                base_val = init_price * ((1 + g_rate) ** y)
-                if asset_class == "Stock" and trailing_pe:
-                    pe_step = trailing_pe + (m_val - trailing_pe) * (y / proj_years)
-                    price = base_val * (pe_step / max(trailing_pe, 1.0))
-                else:
-                    price = base_val
-                prices.append(price)
-            chart_data[sc_name] = prices
-
-        df_chart = pd.DataFrame(chart_data).set_index("Year")
-
-        col_chart, col_table = st.columns([2, 1])
-        with col_chart:
-            st.line_chart(df_chart)
-        with col_table:
-            summary_df = pd.DataFrame([
-                {
-                    "Scenario": k,
-                    "Intrinsic Value": v["intrinsic_value"],
-                    "Target Price": v["target_price"],
-                    "Implied CAGR": v["cagr"]
-                }
-                for k, v in scenarios.items()
-            ]).set_index("Scenario")
-            
-            st.dataframe(
-                summary_df.style.format({
-                    "Intrinsic Value": "${:,.2f}",
-                    "Target Price": "${:,.2f}",
-                    "Implied CAGR": "{:,.2f}%"
-                }),
-                use_container_width=True
-            )
-
-    except Exception as e:
-        st.error(f"Unable to process ticker '{ticker_input}'. Please verify the symbol and try again.")
-        st.caption(f"Error details: {e}")
+        "trailing_pe": trailing_pe,
+        "forward_pe": forward_pe,
+        "trailing_eps": trailing_eps,
+        "forward_eps": forward_eps,
+        "rev_per_share": rev_per_share,
+        "ps_ratio": ps_ratio,
+        "div_yield": div_yield,
+        "hist_
