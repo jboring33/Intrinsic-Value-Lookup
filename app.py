@@ -1,7 +1,7 @@
+import numpy as np
+import pandas as pd
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
 
 st.set_page_config(
     page_title="Universal Asset Valuation & Intrinsic Value Model",
@@ -47,6 +47,16 @@ MINING_KEYWORDS = (
 
 def clamp(val: float, low: float, high: float) -> float:
     return max(low, min(float(val), high))
+
+
+def _safe_float(val) -> float | None:
+    if val is None:
+        return None
+    try:
+        fval = float(val)
+        return None if (np.isnan(fval) or np.isinf(fval)) else fval
+    except (TypeError, ValueError):
+        return None
 
 
 def classify_asset(ticker_symbol: str, info: dict) -> tuple[str, str]:
@@ -112,15 +122,79 @@ def classify_asset(ticker_symbol: str, info: dict) -> tuple[str, str]:
 def fetch_current_price(ticker: yf.Ticker, info: dict) -> float:
     """Fetches current market price; raises ValueError if symbol is invalid/unpriced."""
     for key in ("currentPrice", "regularMarketPrice", "previousClose", "navPrice"):
-        val = info.get(key)
-        if val is not None and float(val) > 0:
-            return float(val)
+        val = _safe_float(info.get(key))
+        if val is not None and val > 0:
+            return val
+
+    try:
+        fast = getattr(ticker, "fast_info", None) or {}
+        for key in ("lastPrice", "previousClose", "regularMarketPreviousClose"):
+            val = _safe_float(fast.get(key) if hasattr(fast, "get") else getattr(fast, key, None))
+            if val is not None and val > 0:
+                return val
+    except Exception:
+        pass
 
     hist = ticker.history(period="5d", auto_adjust=False)
-    if not hist.empty and float(hist["Close"].iloc[-1]) > 0:
-        return float(hist["Close"].iloc[-1])
+    if not hist.empty:
+        last_close = _safe_float(hist["Close"].iloc[-1])
+        if last_close is not None and last_close > 0:
+            return last_close
 
     raise ValueError(f"No valid market price found for '{ticker.ticker}'. Check the ticker symbol.")
+
+
+def extract_statement_fundamentals(ticker: yf.Ticker, info: dict) -> tuple[float | None, float | None]:
+    """
+    Fallback extraction for TTM EPS and Revenue/Share from financial statements
+    when ticker.info omits them.
+    """
+    ttm_eps = None
+    rev_per_share = None
+
+    shares = _safe_float(info.get("sharesOutstanding") or info.get("impliedSharesOutstanding"))
+    if shares is None or shares <= 0:
+        try:
+            fast = getattr(ticker, "fast_info", None) or {}
+            shares = _safe_float(fast.get("shares") if hasattr(fast, "get") else getattr(fast, "shares", None))
+        except Exception:
+            shares = None
+
+    for stmt_attr in ("quarterly_income_stmt", "income_stmt"):
+        try:
+            stmt = getattr(ticker, stmt_attr, None)
+            if stmt is None or stmt.empty:
+                continue
+
+            cols = list(stmt.columns)[:4] if stmt_attr == "quarterly_income_stmt" else list(stmt.columns)[:1]
+            if not cols:
+                continue
+
+            if ttm_eps is None:
+                for row_label in ("Diluted EPS", "Basic EPS"):
+                    if row_label in stmt.index:
+                        vals = [_safe_float(stmt.loc[row_label, c]) for c in cols]
+                        valid_vals = [v for v in vals if v is not None]
+                        if valid_vals:
+                            ttm_eps = sum(valid_vals) if stmt_attr == "quarterly_income_stmt" else valid_vals[0]
+                            break
+
+            if rev_per_share is None and shares and shares > 0:
+                for row_label in ("Total Revenue", "Operating Revenue"):
+                    if row_label in stmt.index:
+                        vals = [_safe_float(stmt.loc[row_label, c]) for c in cols]
+                        valid_vals = [v for v in vals if v is not None]
+                        if valid_vals:
+                            ttm_rev = sum(valid_vals) if stmt_attr == "quarterly_income_stmt" else valid_vals[0]
+                            rev_per_share = ttm_rev / shares
+                            break
+
+            if ttm_eps is not None and rev_per_share is not None:
+                break
+        except Exception:
+            continue
+
+    return ttm_eps, rev_per_share
 
 
 def compute_historical_cagr(ticker: yf.Ticker, years: int = 5, auto_adjust: bool = True) -> float | None:
@@ -128,56 +202,74 @@ def compute_historical_cagr(ticker: yf.Ticker, years: int = 5, auto_adjust: bool
     try:
         hist = ticker.history(period=f"{years}y", auto_adjust=auto_adjust)
         if len(hist) >= 200:
-            start_px = float(hist["Close"].iloc[0])
-            end_px = float(hist["Close"].iloc[-1])
+            start_px = _safe_float(hist["Close"].iloc[0])
+            end_px = _safe_float(hist["Close"].iloc[-1])
             actual_years = len(hist) / 252.0
-            if start_px > 0 and actual_years > 0.5:
+            if start_px and end_px and start_px > 0 and actual_years > 0.5:
                 return (end_px / start_px) ** (1.0 / actual_years) - 1.0
     except Exception:
         pass
     return None
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def get_calibrated_inputs(ticker_symbol: str) -> dict:
     """Fetches yfinance data and calibrates realistic baseline inputs per asset class."""
-    ticker = yf.Ticker(ticker_symbol)
+    clean_sym = ticker_symbol.upper().strip()
+    ticker = yf.Ticker(clean_sym)
     try:
         info = ticker.info or {}
     except Exception:
         info = {}
 
     current_price = fetch_current_price(ticker, info)
-    asset_class, metal_focus = classify_asset(ticker_symbol, info)
+    asset_class, metal_focus = classify_asset(clean_sym, info)
 
-    nav_price = info.get("navPrice")
-    nav_price = float(nav_price) if nav_price and float(nav_price) > 0 else None
+    nav_price = _safe_float(info.get("navPrice"))
+    if nav_price is not None and nav_price <= 0:
+        nav_price = None
 
-    trailing_pe = info.get("trailingPE")
-    trailing_pe = float(trailing_pe) if trailing_pe and float(trailing_pe) > 0 else None
+    trailing_pe = _safe_float(info.get("trailingPE"))
+    if trailing_pe is not None and trailing_pe <= 0:
+        trailing_pe = None
 
-    forward_pe = info.get("forwardPE")
-    forward_pe = float(forward_pe) if forward_pe and float(forward_pe) > 0 else None
+    forward_pe = _safe_float(info.get("forwardPE"))
+    if forward_pe is not None and forward_pe <= 0:
+        forward_pe = None
 
-    trailing_eps = info.get("trailingEps")
-    trailing_eps = float(trailing_eps) if trailing_eps is not None else None
+    trailing_eps = _safe_float(info.get("trailingEps"))
+    forward_eps = _safe_float(info.get("forwardEps"))
 
-    forward_eps = info.get("forwardEps")
-    forward_eps = float(forward_eps) if forward_eps is not None else None
+    rev_per_share = _safe_float(info.get("revenuePerShare"))
+    if rev_per_share is not None and rev_per_share <= 0:
+        rev_per_share = None
+
+    stmt_eps, stmt_rev_ps = extract_statement_fundamentals(ticker, info)
+    if trailing_eps is None and stmt_eps is not None:
+        trailing_eps = stmt_eps
+    if rev_per_share is None and stmt_rev_ps is not None:
+        rev_per_share = stmt_rev_ps
 
     if trailing_eps is None and trailing_pe:
         trailing_eps = current_price / trailing_pe
     if forward_eps is None and forward_pe:
         forward_eps = current_price / forward_pe
+    if trailing_pe is None and trailing_eps and trailing_eps > 0:
+        trailing_pe = current_price / trailing_eps
+    if forward_pe is None and forward_eps and forward_eps > 0:
+        forward_pe = current_price / forward_eps
 
-    rev_per_share = info.get("revenuePerShare")
-    rev_per_share = float(rev_per_share) if rev_per_share and float(rev_per_share) > 0 else None
-    ps_ratio = info.get("priceToSalesTrailing12Months")
-    ps_ratio = float(ps_ratio) if ps_ratio and float(ps_ratio) > 0 else None
+    ps_ratio = _safe_float(info.get("priceToSalesTrailing12Months"))
+    if (ps_ratio is None or ps_ratio <= 0) and rev_per_share and rev_per_share > 0:
+        ps_ratio = current_price / rev_per_share
 
-    div_yield = info.get("dividendYield") or info.get("yield") or 0.0
-    div_yield = float(div_yield)
-    if div_yield > 0.25:
-        div_yield = div_yield / 100.0
+    # Prefer dividendRate / current_price when available to avoid % vs decimal ambiguity
+    div_rate = _safe_float(info.get("dividendRate") or info.get("trailingAnnualDividendRate"))
+    if div_rate is not None and div_rate > 0 and current_price > 0:
+        div_yield = div_rate / current_price
+    else:
+        raw_dy = _safe_float(info.get("dividendYield") or info.get("yield")) or 0.0
+        div_yield = raw_dy / 100.0 if raw_dy > 0.25 else raw_dy
     div_yield = clamp(div_yield, 0.0, 0.20)
 
     hist_cagr_5y = compute_historical_cagr(ticker, years=5, auto_adjust=True)
@@ -203,11 +295,11 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
         valuation_basis = "Yield & NAV Compounding"
 
     else:
-        raw_eg = info.get("earningsGrowth")
-        raw_rg = info.get("revenueGrowth")
-        candidates = [float(x) for x in (raw_eg, raw_rg) if x is not None and -0.5 < float(x) < 1.0]
+        raw_eg = _safe_float(info.get("earningsGrowth"))
+        raw_rg = _safe_float(info.get("revenueGrowth"))
+        candidates = [x for x in (raw_eg, raw_rg) if x is not None and -0.5 < x < 1.0]
         if candidates:
-            blended_g = np.mean(candidates)
+            blended_g = float(np.mean(candidates))
             raw_growth = 0.6 * blended_g + 0.4 * 0.08
         elif hist_cagr_5y is not None:
             raw_growth = clamp(hist_cagr_5y, 0.02, 0.15)
@@ -230,8 +322,8 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
             valuation_basis = "Price-Anchored Fallback (Missing EPS/Rev)"
 
     return {
-        "ticker": ticker_symbol.upper(),
-        "long_name": info.get("longName") or info.get("shortName") or ticker_symbol.upper(),
+        "ticker": clean_sym,
+        "long_name": info.get("longName") or info.get("shortName") or clean_sym,
         "asset_class": asset_class,
         "metal_focus": metal_focus,
         "valuation_basis": valuation_basis,
@@ -259,6 +351,7 @@ def get_calibrated_inputs(ticker_symbol: str) -> dict:
             "trailingPE": trailing_pe,
             "forwardPE": forward_pe,
             "revenuePerShare": rev_per_share,
+            "dividendRate": div_rate,
             "dividendYield": round(div_yield * 100, 2),
             "5Y_TotalReturn_CAGR_%": round(hist_cagr_5y * 100, 2) if hist_cagr_5y is not None else None,
         },
@@ -287,7 +380,11 @@ def calculate_scenario_valuation(
             pv_dividends += dy / ((1.0 + discount_rate) ** y)
 
     if asset_class in ("Stock", "Metals & Mining Stock"):
-        anchor_eps = data["forward_eps"] if (data["forward_eps"] and data["forward_eps"] > 0) else data["trailing_eps"]
+        anchor_eps = (
+            data["forward_eps"]
+            if (data["forward_eps"] and data["forward_eps"] > 0)
+            else data["trailing_eps"]
+        )
         if anchor_eps and anchor_eps > 0:
             future_eps = anchor_eps * ((1.0 + growth_rate) ** proj_years)
             target_price = future_eps * exit_multiple
@@ -321,9 +418,13 @@ def calculate_scenario_valuation(
 def get_actionable_signal(
     current_price: float,
     intrinsic_value: float,
+    valuation_basis: str,
     nav_spread_pct: float | None = None,
-) -> tuple[str, str, float]:
+) -> tuple[str, str, float | None]:
     """Generates Buy/Hold/Sell signal based on Margin of Safety (or NAV discount for physical trusts)."""
+    if valuation_basis.startswith("Price-Anchored Fallback"):
+        return "⚠️ INSUFFICIENT FUNDAMENTALS (PRICE-ANCHORED ONLY)", "warning", None
+
     if nav_spread_pct is not None:
         if nav_spread_pct <= -3.0:
             return "🟢 TRADING AT SIGNIFICANT DISCOUNT TO NAV", "success", -nav_spread_pct
@@ -357,10 +458,10 @@ st.markdown(
 
 col_search, col_examples = st.columns([1, 2])
 with col_search:
-    ticker_input = st.text_input("Enter Stock, ETF, or Metals Ticker:", value="AAPL").strip().upper()
+    ticker_input = st.text_input("Enter Stock, ETF, or Metals Ticker:", value="COST").strip().upper()
 with col_examples:
     st.caption(
-        "Examples: `AAPL`, `MSFT` (Stocks) • `SCHD`, `SPYI`, `QQQ` (ETFs) • "
+        "Examples: `COST`, `AAPL`, `MSFT` (Stocks) • `SCHD`, `SPYI`, `QQQ` (ETFs) • "
         "`PHYS`, `PSLV`, `GLD`, `IAU`, `SLV` (Physical Metals) • `NEM`, `GDX`, `SILJ` (Miners)"
     )
 
@@ -383,10 +484,16 @@ if ticker_input:
         st.sidebar.header("⚙️ Model Parameters")
         proj_years = st.sidebar.slider("Projection Horizon (Years)", 1, 15, 5)
         default_disc = 7.0 if asset_class == "Physical Bullion / Commodity Trust" else 9.0
-        discount_rate = st.sidebar.slider("Discount Rate / Required Return (%)", 4.0, 15.0, default_disc, step=0.5) / 100.0
+        discount_rate = (
+            st.sidebar.slider("Discount Rate / Required Return (%)", 4.0, 15.0, default_disc, step=0.5) / 100.0
+        )
 
         base_growth_pct = round(data["growth_rate"] * 100.0, 2)
-        spread = 3.0 if asset_class in ("Physical Bullion / Commodity Trust", "Equity / Income ETF", "Fund / Bond") else 4.0
+        spread = (
+            3.0
+            if asset_class in ("Physical Bullion / Commodity Trust", "Equity / Income ETF", "Fund / Bond")
+            else 4.0
+        )
 
         default_low = clamp(round(base_growth_pct - spread, 2), -20.0, 30.0)
         default_med = clamp(base_growth_pct, -20.0, 40.0)
@@ -400,11 +507,18 @@ if ticker_input:
         growth_med = st.sidebar.slider(f"Base {growth_label} (%)", -20.0, 40.0, float(default_med), step=0.5) / 100.0
         growth_high = st.sidebar.slider(f"High {growth_label} (%)", -20.0, 50.0, float(default_high), step=0.5) / 100.0
 
-        if asset_class in ("Stock", "Metals & Mining Stock") and (data["forward_eps"] or data["trailing_eps"]):
+        has_eps = bool((data["forward_eps"] and data["forward_eps"] > 0) or (data["trailing_eps"] and data["trailing_eps"] > 0))
+        if asset_class in ("Stock", "Metals & Mining Stock") and has_eps:
             base_mult = round(data["exit_multiple"], 1)
-            mult_low = st.sidebar.slider("Low Exit P/E", 4.0, 50.0, float(clamp(round(base_mult * 0.8, 1), 4.0, 50.0)), step=0.5)
-            mult_med = st.sidebar.slider("Base Exit P/E", 4.0, 60.0, float(clamp(base_mult, 4.0, 60.0)), step=0.5)
-            mult_high = st.sidebar.slider("High Exit P/E", 4.0, 70.0, float(clamp(round(base_mult * 1.2, 1), 4.0, 70.0)), step=0.5)
+            mult_low = st.sidebar.slider(
+                "Low Exit P/E", 4.0, 50.0, float(clamp(round(base_mult * 0.8, 1), 4.0, 50.0)), step=0.5
+            )
+            mult_med = st.sidebar.slider(
+                "Base Exit P/E", 4.0, 60.0, float(clamp(base_mult, 4.0, 60.0)), step=0.5
+            )
+            mult_high = st.sidebar.slider(
+                "High Exit P/E", 4.0, 70.0, float(clamp(round(base_mult * 1.2, 1), 4.0, 70.0)), step=0.5
+            )
         else:
             mult_low = mult_med = mult_high = data["exit_multiple"]
 
@@ -458,21 +572,27 @@ if ticker_input:
             )
 
         med_iv = scenarios["Medium (Base)"]["intrinsic_value"]
-        signal_text, signal_type, margin = get_actionable_signal(init_price, med_iv, nav_spread_pct)
+        signal_text, signal_type, margin = get_actionable_signal(
+            init_price, med_iv, data["valuation_basis"], nav_spread_pct
+        )
+        margin_suffix = f" ({margin:+.1f}%)" if margin is not None else ""
         if signal_type == "success":
-            st.success(f"**Model Signal:** {signal_text} ({margin:+.1f}%)")
+            st.success(f"**Model Signal:** {signal_text}{margin_suffix}")
         elif signal_type == "warning":
-            st.warning(f"**Model Signal:** {signal_text} ({margin:+.1f}%)")
+            st.warning(f"**Model Signal:** {signal_text}{margin_suffix}")
         else:
-            st.error(f"**Model Signal:** {signal_text} ({margin:+.1f}%)")
+            st.error(f"**Model Signal:** {signal_text}{margin_suffix}")
 
         st.write("---")
         st.subheader("📈 Multi-Scenario Projection Trajectory")
 
         years_seq = list(range(0, proj_years + 1))
         chart_data = {"Year": years_seq}
-        anchor_eps = data["forward_eps"] if (data["forward_eps"] and data["forward_eps"] > 0) else data["trailing_eps"]
-        start_pe = data["forward_pe"] or data["trailing_pe"] or mult_med
+        anchor_eps = (
+            data["forward_eps"]
+            if (data["forward_eps"] and data["forward_eps"] > 0)
+            else data["trailing_eps"]
+        )
 
         for sc_name, g_rate, m_val in [
             ("Low Case", growth_low, mult_low),
@@ -484,10 +604,13 @@ if ticker_input:
                 if y == 0:
                     prices.append(init_price)
                 elif asset_class in ("Stock", "Metals & Mining Stock") and anchor_eps and anchor_eps > 0:
-                    pe_step = start_pe + (m_val - start_pe) * (y / proj_years)
-                    prices.append(anchor_eps * ((1.0 + g_rate) ** y) * pe_step)
+                    prices.append(anchor_eps * ((1.0 + g_rate) ** y) * m_val)
                 else:
-                    base_anchor = nav_price if (asset_class == "Physical Bullion / Commodity Trust" and nav_price) else init_price
+                    base_anchor = (
+                        nav_price
+                        if (asset_class == "Physical Bullion / Commodity Trust" and nav_price)
+                        else init_price
+                    )
                     prices.append(base_anchor * ((1.0 + g_rate) ** y))
             chart_data[sc_name] = prices
 
@@ -518,7 +641,7 @@ if ticker_input:
                         "Implied CAGR": "{:,.2f}%",
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
             )
 
         with st.expander("🔍 Inspect Raw Yahoo Finance Inputs (Data Audit)"):
